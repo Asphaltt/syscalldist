@@ -68,4 +68,7 @@ core.*
 /vendor/
 /bin/
 
+Makefile
+
 /syscall_bpf*
+syscalldist

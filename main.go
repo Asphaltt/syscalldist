@@ -6,6 +6,8 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
+	"sort"
 	"syscall"
 
 	"syscalldist/pkg/histogram"
@@ -20,19 +22,26 @@ import (
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang syscall ./ebpf/syscall.c -- -I./ebpf/headers -Wall -D__TARGET_ARCH_x86
 
+//go:generate go run ./gogen syscallname.go
+
 func main() {
 	var filterPid, filterSyscallID uint32
-	var kernelBtf string
+	var filterSyscallName, kernelBtf string
+	var listSyscall bool
 	flag.Uint32Var(&filterPid, "pid", 0, "filter pid")
 	flag.Uint32Var(&filterSyscallID, "syscall", 0, "filter syscall id")
+	flag.StringVar(&filterSyscallName, "syscall-name", "", "filter syscall name")
 	flag.StringVar(&kernelBtf, "kernel-btf", "", "kernel BTF file")
+	flag.BoolVarP(&listSyscall, "list-syscall", "l", false, "list syscalls of amd64 Linux used by Go syscall")
 	flag.Parse()
 
-	if filterPid == 0 {
-		log.Fatalf("--pid is required")
+	if listSyscall {
+		printSyscall()
+		return
 	}
-	if filterSyscallID == 0 {
-		log.Fatalf("--syscall is required")
+
+	if filterSyscallID == 0 && filterSyscallName != "" {
+		filterSyscallID = uint32(syscallsName2num[filterSyscallName])
 	}
 
 	err := rlimit.RemoveMemlock()
@@ -100,7 +109,7 @@ func main() {
 
 	<-ctx.Done()
 
-	printHist(objs.Hists, filterSyscallID)
+	printHist(objs.Hists)
 }
 
 const (
@@ -111,23 +120,55 @@ type slot struct {
 	Slots [maxSlots]uint64
 }
 
-func printHist(m *ebpf.Map, syscallID uint32) {
-	slotNumber := 1
-	slots := make([]slot, slotNumber)
+func printHist(m *ebpf.Map) {
+	slotNumber := 512
+	slots := make([]slot, runtime.NumCPU())
 
 	for key := uint32(0); key < uint32(slotNumber); key++ {
-		err := m.Lookup(key, &slots[key])
+		err := m.Lookup(key, &slots)
 		if err != nil {
 			log.Printf("Failed to lookup key(%d): %v", key, err)
 			return
 		}
-	}
 
-	for _, s := range slots[:] {
+		var s slot
+		for i, slot := range slots {
+			s.Slots[i] += slot.Slots[i]
+		}
+
 		sum := lodash.Sum(s.Slots[:])
 
+		if sum == 0 {
+			continue
+		}
+
+		name := syscallsNum2name[int(key)]
+		if name != "" {
+			name = "/" + name
+		}
+
 		fmt.Println()
-		fmt.Printf("Histogram for syscall(%d) (sum %d):\n", syscallID, sum)
+		fmt.Printf("Histogram for syscall(%d%s) (sum %d):\n", key, name, sum)
 		histogram.PrintLog2Hist(s.Slots[:], "usecs")
+	}
+}
+
+func printSyscall() {
+	type syscall struct {
+		no   int
+		name string
+	}
+	var syscalls []syscall
+
+	for no, name := range syscallsNum2name {
+		syscalls = append(syscalls, syscall{no, name})
+	}
+
+	sort.Slice(syscalls, func(i, j int) bool {
+		return syscalls[i].no < syscalls[j].no
+	})
+
+	for _, s := range syscalls {
+		fmt.Printf("%s -> %d\n", s.name, s.no)
 	}
 }

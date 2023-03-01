@@ -25,27 +25,27 @@ struct hist {
 };
 
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __type(key, __u32);
     __type(value, struct hist);
-    __uint(max_entries, 1);
+    __uint(max_entries, 512);
 } hists SEC(".maps");
 
 SEC("raw_tracepoint/sys_enter")
 int sys_enter(struct bpf_raw_tracepoint_args *ctx)
 {
     __u64 syscall_id = ctx->args[1];
-    if (syscall_id != filter_syscall_id)
-        return 0;
+    if (filter_syscall_id && syscall_id != filter_syscall_id)
+        return BPF_OK;
 
-    __u32 pid = (__u32)bpf_get_current_pid_tgid();
-    if (pid != filter_pid)
-        return 0;
+    __u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+    if (filter_pid && pid != filter_pid)
+        return BPF_OK;
 
     __u64 ts = bpf_ktime_get_ns();
     bpf_map_update_elem(&clocks, &pid, &ts, BPF_ANY);
 
-    return 0;
+    return BPF_OK;
 }
 
 SEC("raw_tracepoint/sys_exit")
@@ -53,29 +53,30 @@ int sys_exit(struct bpf_raw_tracepoint_args *ctx)
 {
     struct pt_regs *args = (struct pt_regs *)ctx->args[0];
     __u64 syscall_id = BPF_CORE_READ(args, orig_ax);
-    if (syscall_id != filter_syscall_id)
-        return 0;
+    if (filter_syscall_id && syscall_id != filter_syscall_id)
+        return BPF_OK;
 
-    __u32 pid = (__u32)bpf_get_current_pid_tgid();
-    if (pid != filter_pid)
-        return 0;
+    __u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+    if (filter_pid && pid != filter_pid)
+        return BPF_OK;
 
     __u64 *tsp = bpf_map_lookup_and_delete(&clocks, &pid);
     if (!tsp)
-        return 0;
+        return BPF_OK;
 
     struct hist initial_hist = {};
-    __u32 index = 0;
+    __u32 index = syscall_id;
     struct hist *hp = bpf_map_lookup_or_try_init(&hists, &index, &initial_hist);
     if (!hp)
-        return 0;
+        return BPF_OK;
 
     __u64 delta = bpf_ktime_get_ns() - *tsp;
     delta /= 1000; // micro-second
     __u64 slot = log2l(delta);
     if (slot >= MAX_SLOTS)
         slot = MAX_SLOTS - 1;
-    __sync_fetch_and_add(&hp->slots[slot], 1);
 
-    return 0;
+    hp->slots[slot]++;
+
+    return BPF_OK;
 }
